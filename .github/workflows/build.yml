@@ -37,10 +37,13 @@ jobs:
           - {kmi: android15-6.6, clang: clang-r510928}
           - {kmi: android16-6.12, clang: clang-r536225}
           - {kmi: android17-6.18, clang: clang-r584948c}
+    # Job-level `env` only allows github/needs/strategy/matrix/vars/inputs contexts.
+    # The `runner` context is NOT available here -- that is what raised
+    # "Unrecognized named-value: 'runner'". $RUNNER_TEMP is still exported to every
+    # step as a shell variable, so we reference it directly inside run: instead.
     env:
       KMI: ${{ matrix.kmi }}
       CLANG: ${{ matrix.clang }}
-      STAGE: ${{ runner.temp }}/stage/${{ matrix.kmi }}
     steps:
       # Supply-chain hardening: pin third-party actions to a full commit SHA, not just a tag
       # (tags can be re-moved). Replace <sha> below with the resolved commit for each version.
@@ -54,6 +57,7 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
+          STAGE="$RUNNER_TEMP/stage/$KMI"
           TOSYA_KBUILD_JOBS="$(nproc)" bash scripts/build-kmi.sh \
             "$KMI" "$CLANG" \
             "$STAGE" \
