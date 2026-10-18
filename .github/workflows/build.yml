@@ -1,3 +1,4 @@
+
 name: build
 
 on:
@@ -7,10 +8,15 @@ on:
   workflow_dispatch:
 
 # One job per kernel family, in parallel, each inside the image that family is built in.
-#
 
 permissions:
   contents: read
+
+# Cancel superseded runs on the same ref so a force-push / rapid merge does not burn
+# a full matrix of privileged containers. Tag pushes are excluded so release artifacts survive.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   ko:
@@ -31,8 +37,14 @@ jobs:
           - {kmi: android15-6.6, clang: clang-r510928}
           - {kmi: android16-6.12, clang: clang-r536225}
           - {kmi: android17-6.18, clang: clang-r584948c}
+    env:
+      KMI: ${{ matrix.kmi }}
+      CLANG: ${{ matrix.clang }}
+      STAGE: ${{ runner.temp }}/stage/${{ matrix.kmi }}
     steps:
-      - uses: actions/checkout@v7
+      # Supply-chain hardening: pin third-party actions to a full commit SHA, not just a tag
+      # (tags can be re-moved). Replace <sha> below with the resolved commit for each version.
+      - uses: actions/checkout@v7            # pin: actions/checkout@<sha>  # v7
         with:
           fetch-depth: 0
       - name: Check formatting
@@ -43,8 +55,18 @@ jobs:
         run: |
           set -euo pipefail
           TOSYA_KBUILD_JOBS="$(nproc)" bash scripts/build-kmi.sh \
-            "${{ matrix.kmi }}" "${{ matrix.clang }}" \
-            "$RUNNER_TEMP/stage/${{ matrix.kmi }}" \
-            "out/${{ matrix.kmi }}_arm64_tosya.ko"
-          NM="/opt/ddk/clang/${{ matrix.clang }}/bin/llvm-nm" \
+            "$KMI" "$CLANG" \
+            "$STAGE" \
+            "out/${KMI}_arm64_tosya.ko"
+          NM="/opt/ddk/clang/${CLANG}/bin/llvm-nm" \
             bash scripts/check-undefined.sh out/*.ko
+      - name: Upload ko
+        # upload-artifact v7 runs on Node 24 (needs Actions Runner >= 2.327.1). v7 adds
+        # `archive: false` for direct single-file upload, but that ignores `name`, so we keep
+        # the default archive mode here to preserve the per-matrix artifact name below.
+        uses: actions/upload-artifact@v7.0.2  # pin: actions/upload-artifact@<sha>  # v7.0.2
+        with:
+          name: tosya-${{ matrix.kmi }}
+          path: out/*.ko
+          if-no-files-found: error
+          retention-days: 90
