@@ -7,7 +7,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# One job per kernel family, in parallel, each inside the image that family is built in.
+# One ko job per kernel family, in parallel, each inside the image that family is built in.
+# A separate uidbench job cross-compiles the one optional tool in this tree that wants the
+# Android NDK. This tree produces only the modules and that tool: there is no package, no
+# userspace loader and no boot script here, so CI does not touch tags, versionCode or zip
+# packaging -- the repository holding the userspace half packages these .ko files.
 
 permissions:
   contents: read
@@ -33,44 +37,70 @@ jobs:
           - {kmi: android13-5.10, clang: clang-r450784e}
           - {kmi: android13-5.15, clang: clang-r450784e}
           - {kmi: android14-5.15, clang: clang-r487747c}
-          - {kmi: android14-6.1, clang: clang-r487747c}
-          - {kmi: android15-6.6, clang: clang-r510928}
+          - {kmi: android14-6.1,  clang: clang-r487747c}
+          - {kmi: android15-6.6,  clang: clang-r510928}
           - {kmi: android16-6.12, clang: clang-r536225}
           - {kmi: android17-6.18, clang: clang-r584948c}
-    # Job-level `env` only allows github/needs/strategy/matrix/vars/inputs contexts.
-    # The `runner` context is NOT available here -- that is what raised
-    # "Unrecognized named-value: 'runner'". $RUNNER_TEMP is still exported to every
-    # step as a shell variable, so we reference it directly inside run: instead.
+    # Job-level `env` only allows github/needs/strategy/matrix/vars/inputs contexts --
+    # the `runner` context is NOT available here. Kbuild objects and the produced module
+    # go under build/ (build/kmi/<KMI> and build/ko/<KMI>_arm64_tosya.ko), matching
+    # scripts/build-kmi.sh as documented in build.md, so nothing depends on RUNNER_TEMP.
     env:
       KMI: ${{ matrix.kmi }}
       CLANG: ${{ matrix.clang }}
     steps:
-      # Supply-chain hardening: pin third-party actions to a full commit SHA, not just a tag
-      # (tags can be re-moved). Replace <sha> below with the resolved commit for each version.
+      # Supply-chain hardening: pin third-party actions to a full commit SHA, not just a
+      # tag (tags can be re-moved). Replace <sha> below with the resolved commit.
       - uses: actions/checkout@v7            # pin: actions/checkout@<sha>  # v7
         with:
           fetch-depth: 0
       - name: Check formatting
-        # Inside the image on purpose: it carries the clang-format this repository is written
-        # against, and a bare runner disagrees with it about the spacing written inside braces.
+        # Inside the image on purpose: it carries the clang-format this repository is
+        # written against, and a bare runner disagrees with it about the spacing written
+        # inside braces.
         run: bash scripts/check-format.sh
       - name: Build
         run: |
           set -euo pipefail
-          STAGE="$RUNNER_TEMP/stage/$KMI"
+          # build/kmi/<KMI> holds the symlinked sources and Kbuild objects;
+          # build/ko/ collects the loadable module, exactly as scripts/build-kmi.sh is
+          # documented to behave in build.md.
           TOSYA_KBUILD_JOBS="$(nproc)" bash scripts/build-kmi.sh \
             "$KMI" "$CLANG" \
-            "$STAGE" \
-            "out/${KMI}_arm64_tosya.ko"
+            "build/kmi/$KMI" \
+            "build/ko/${KMI}_arm64_tosya.ko"
           NM="/opt/ddk/clang/${CLANG}/bin/llvm-nm" \
-            bash scripts/check-undefined.sh out/*.ko
+            bash scripts/check-undefined.sh build/ko/*.ko
       - name: Upload ko
         # upload-artifact v7 runs on Node 24 (needs Actions Runner >= 2.327.1). v7 adds
-        # `archive: false` for direct single-file upload, but that ignores `name`, so we keep
-        # the default archive mode here to preserve the per-matrix artifact name below.
+        # `archive: false` for direct single-file upload, but that ignores `name`, so we
+        # keep the default archive mode to preserve the per-matrix artifact name below.
         uses: actions/upload-artifact@v7.0.2  # pin: actions/upload-artifact@<sha>  # v7.0.2
         with:
           name: tosya-${{ matrix.kmi }}
-          path: out/*.ko
+          path: build/ko/*.ko
+          if-no-files-found: error
+          retention-days: 90
+
+  uidbench:
+    # Optional measurement tool. Not a package component and not a kernel module, so it
+    # builds on the bare runner (which ships the Android NDK) instead of a privileged DDK
+    # container. Cross-compiled to aarch64-android34 per build.md.
+    name: uidbench (aarch64-android34)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7            # pin: actions/checkout@<sha>  # v7
+      - name: Cross-compile uidbench
+        run: |
+          set -euo pipefail
+          NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:?Android NDK not found on runner}}"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang" \
+            -O2 -static -o uidbench src/tools/uidbench.c
+          file uidbench
+      - name: Upload uidbench
+        uses: actions/upload-artifact@v7.0.2  # pin: actions/upload-artifact@<sha>  # v7.0.2
+        with:
+          name: uidbench-aarch64-android34
+          path: uidbench
           if-no-files-found: error
           retention-days: 90
