@@ -1,0 +1,7 @@
+id=tosya
+name=Tosya
+# Fallback only: the build replaces these two with the git tag and the short hash.
+version=0.6.0
+versionCode=6000
+author=KodateMitsuru
+description=Makes the uid of an app hidden by HMA (or HMA-OSS) answer as if it did not exist. This module is for advanced users only, and it may cause issues with some apps. Use at your own risk.

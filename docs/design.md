@@ -178,13 +178,15 @@ An isolated process gets its uid at birth and nothing else says which app it cam
 
 The kernel half takes two blobs over its netlink family and nothing else: the (caller, target) policy,
 and the APK paths whose inodes are named after the package a process was born from. Whoever produces
-them is the userspace half, and this repository does not ship one: the two blobs and the shapes in
-`kaux.h` are the whole contract, and a device that never pushes them is a device that hides nothing.
+them is the userspace half: `src/tools` holds it, it reads the apps' configs, the package database and
+the user list, and it pushes the two blobs as streams. The shapes in `kaux.h` are the whole contract,
+and a device that never pushes them is a device that hides nothing.
 
 A readable, empty policy clears it; a policy that does not fit, or a caller that is not an app uid, is
-refused and the previous one stays in force. APK messages are deltas with an add/confirm/drop ledger, so
-a lost reply cannot leave a shadow nobody retires; an add batch is confirmed only when the status reports
- the expected count and zero failures, and uncertain additions are retried one by one.
+refused and the previous one stays in force. APK messages are deltas with an add/drop ledger, so a lost
+reply cannot leave a shadow nobody retires: the kernel applies an add as it arrives and parks a drop,
+and the userspace half re-derives the difference from the device's own files on every pass, so an
+uncertain record is named again rather than confirmed.
 
 ## Patch writes
 
@@ -269,29 +271,35 @@ the running kernel's config (`/proc/config.gz`).
 Little endian, defined once in `include/kaux.h`, which the module and the tool both include. The
 family is named after the module, `tosya`, because generic netlink families share one
 namespace: a generic name could be taken by another module, and the tool resolves the family by name,
-so it would then be talking to that module. The family version is 4 and the kernel rejects a request
+so it would then be talking to that module. The family version is 6 and the kernel rejects a request
 that does not carry it, so a helper and a module of different versions cannot read each other's
 command ids. It was 3 through 0.3.x; 4 renamed the family and put one mechanism name per family in
-the status, which changed the structure's size, and the tool checks the status's magic, size and
+the status, which changed the structure's size; 5 moved the staged upload to a stream of records; 6
+added the token the two halves name their exchange with. The tool checks the status's magic, size and
 version before it believes anything in it.
 
 ```
-KAUX_CMD_PING         (1)  no payload, ACK only
-KAUX_CMD_STAGE_BEGIN  (2)  blob: struct kaux_begin {u32 kind, u32 bytes, u32 crc32}
-KAUX_CMD_STAGE_CHUNK  (3)  blob: u32 offset, u32 len, then len bytes
-KAUX_CMD_STAGE_COMMIT (4)  no payload: byte count and CRC are checked, then applied
-KAUX_CMD_STATUS       (5)  reply: KAUX_ATTR_STATUS = struct kaux_status
+KAUX_CMD_PING    (1)  no payload, ACK only
+KAUX_CMD_BEGIN   (2)  blob: struct kaux_begin {u32 kind}: what this stream carries
+KAUX_CMD_BATCH   (3)  blob: struct kaux_batch {u32 count}, then that many records
+KAUX_CMD_END     (4)  no payload: the stream is finished, and applied
+KAUX_CMD_STATUS  (5)  reply: KAUX_ATTR_STATUS = struct kaux_status
 ```
 
-Family `kaux`, all commands `GENL_ADMIN_PERM`; a blob over 32 KiB is rejected before it is parsed.
-A blob goes up in chunks and only becomes live when the commit matches what was announced, so a
-half-uploaded policy never takes effect. `struct kaux_status` carries magic, size and version, so a
-reader that is not looking at the structure it was built for says so instead of misreading it.
+Family `tosya`, all commands `GENL_ADMIN_PERM`; a message over 32 KiB is refused before it is parsed,
+and a batch is split so that none is. Two record layouts: a policy record is `op, caller, target,
+flags`; an apk record is `op, uid, dev, ino_low, ino_high, path_bytes` followed by the path bytes
+zero padded to a four byte boundary -- a drop carries no path, because the file is gone and the
+numbers name it. A record is applied as it arrives and nothing else happens at the end: the set is
+exactly what was added and not removed, so a stream that stops halfway stops. A policy is collected
+for the length of its stream and replaces the live one at its END, so a half-uploaded policy never
+takes effect. `struct kaux_status` carries magic, size and version, so a reader that is not looking
+at the structure it was built for says so instead of misreading it.
 
 | limit | value |
 |---|---|
 | `(caller, target)` pairs | 65536 |
 | callers | 4096 |
-| code dirs (`TOSYA_APK_MAX`) | 10000 |
-| netlink blob (`KAUX_STAGED_BYTES`) | 2 MiB |
-| netlink message (`MAX_BLOB_BYTES`) | 32 KiB |
+| apk records (`TOSYA_APK_MAX`) | 65536 |
+| policy stream buffer | 4 MiB |
+| netlink message | 32 KiB |

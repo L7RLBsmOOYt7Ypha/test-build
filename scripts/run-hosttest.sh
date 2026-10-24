@@ -5,8 +5,8 @@
 # configured (caller, target) pair: catches C-level mistakes the Python model cannot see (word
 # sizes, ordering, field mixups).
 #
-# The ABX reader is C++ and self-contained, so its test is built and run here too, against the
-# first bytes of a real packages.xml.
+# The C++ half of the tree -- the ABX reader, the package database, the rule formats and the
+# wire format of a stream -- is built and run here too, plain and under the sanitizers.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -29,8 +29,69 @@ clang -std=c23 -O1 -Wall -Wextra -D_GNU_SOURCE -pthread -DTOSYA_HOST_TEST -I src
   -I scripts/hosttest -o "$tiers" scripts/tiers_test.c
 "$tiers"
 
+# ---- the userspace half (src/tools, C++) ------------------------------------
+cxx="clang++ -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -I src/include"
+
+# The ABX reader is self-contained, so its test runs against the first bytes of a
+# real packages.xml.
+abx=build/abx_reader_test
+$cxx -o "$abx" scripts/abx_reader_test.cpp src/tools/abx.cpp
+"$abx"
+
+paths=build/rule_sources_test
+$cxx -o "$paths" scripts/rule_sources_test.cpp src/tools/paths.cpp
+"$paths" build/rule_sources_test.d
+
+# The wire format of a stream: the record bytes the module reads, pinned against
+# the values scripts/test-netlink-flow.py drives its own handlers with.
+paging=build/paging_test
+$cxx -o "$paging" scripts/paging_test.cpp src/tools/paging.cpp
+"$paging"
+
+# Both rule formats: what each one does with the same package list, driven with configs instead of
+# a device.
+rules=build/rules_test
+$cxx -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
+  src/tools/preset_rules.cpp \
+  src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp
+"$rules"
+
+presets=build/presets_test
+$cxx -o "$presets" scripts/presets_test.cpp \
+  src/tools/preset_rules.cpp src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp
+"$presets"
+
+packages=build/packages_test
+$cxx -o "$packages" scripts/packages_test.cpp \
+  src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp src/tools/paths.cpp
+"$packages"
+
+packages_xml=build/packages_xml_test
+$cxx -o "$packages_xml" scripts/packages_xml_test.cpp \
+  src/tools/packages_xml.cpp src/tools/abx.cpp src/tools/text_xml.cpp
+"$packages_xml"
+
 # Same sources, one more round under ASan/UBSan: a proxy outliving its owner is not
 # a warning, it is a fault the first time it runs.
+san="clang++ -fsanitize=address,undefined -fno-omit-frame-pointer -std=c++23 -O1 -Wall -Wextra -Wshadow -Wpedantic -Wnon-virtual-dtor -Wdangling-gsl -Wcast-qual -Wconditional-uninitialized -Wunreachable-code -Wnull-dereference -Wdouble-promotion -Wformat=2 -I src/tools -I src/include"
+$san -o "$abx" scripts/abx_reader_test.cpp src/tools/abx.cpp
+$san -o "$paths" scripts/rule_sources_test.cpp src/tools/paths.cpp
+$san -o "$paging" scripts/paging_test.cpp src/tools/paging.cpp
+$san -o "$rules" scripts/rules_test.cpp src/tools/rules.cpp \
+  src/tools/preset_rules.cpp \
+  src/tools/paths.cpp src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp
+$san -o "$presets" scripts/presets_test.cpp \
+  src/tools/preset_rules.cpp src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp
+$san -o "$packages" scripts/packages_test.cpp \
+  src/tools/packages.cpp src/tools/abx.cpp src/tools/packages_xml.cpp src/tools/text_xml.cpp src/tools/paths.cpp
+$san -o "$packages_xml" scripts/packages_xml_test.cpp \
+  src/tools/packages_xml.cpp src/tools/abx.cpp src/tools/text_xml.cpp
+"$abx"
+"$paging"
+"$rules"
+"$presets"
+"$packages"
+"$packages_xml"
 
 # The inode shadow block of src/inode_hook.c is kernel-only, so it is extracted and
 # driven here. The scenarios pin down what went wrong in it: an inode the package
@@ -80,4 +141,3 @@ clang -fsanitize=address,undefined -fno-omit-frame-pointer -std=c23 -O1 -g \
   -Wall -Wextra -D_GNU_SOURCE -pthread -DTOSYA_HOST_TEST -I src -I src/include \
   -I scripts/hosttest -o "$asan" scripts/tiers_test.c
 "$asan"
-

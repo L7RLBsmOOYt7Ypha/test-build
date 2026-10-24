@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- The userspace half is in this tree again. `src/tools` carries it beside `uidbench`: `sync-tool`
+  reads HMA's or HMA-OSS's config, the package database in either form and the user list, works out
+  the (caller, target) pairs the way the apps themselves do, and pushes them -- with the apk records
+  that name an isolated child -- over the `tosya` family. It speaks the stream the module speaks:
+  BEGIN, batches of whole records, END, the policy replacing the live one at its end and the apk side
+  going up as the difference it is. The written-in half of the HMA-OSS presets comes back with it
+  (`scripts/gen_oss_presets.py`, `src/tools/oss_presets.hpp`), and so do the host tests for both
+  halves, plain and under the sanitizers, and the clang-tidy round over the userspace sources.
+
+- The package is assembled here again. The `module` target packs the ko files, `sync-tool`,
+  `lkmloader` (from the `external/lkmloader` submodule) and the boot scripts into one zip, with the
+  version and `versionCode` the git tag gives and `module/module.prop` carries as the fallback. The
+  scripts prefer `/data/adb/ksud insmod` and keep the bundled loader for a device without it, and
+  `service.sh` starts the userspace half and logs to `state/sync.log`. CI packs the zip as a run
+  artifact and publishes nothing, as before. The status line the tool writes names the mechanism in
+  place for each of the two questions (`uid_tier`, `setuid_tier`) rather than the setuid hook's
+  state, and the apk side's cap follows `TOSYA_APK_MAX`, which is what the module takes now.
+
 ## 0.6.0
 
 - The family speaks version 6, and the name both halves work out travels with the state they already

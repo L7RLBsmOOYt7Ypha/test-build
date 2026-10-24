@@ -3,10 +3,16 @@ project(tosya LANGUAGES NONE)
 
 # Usage:
 #   cmake -S . -B build -DDDK_ROOT=/opt/ddk
-#   cmake --build build                     # default target: every KMI module
-#   cmake --build build --target ko         # the same, by name
+#   cmake --build build                     # default target: every KMI module and the zip
+#   cmake --build build --target ko         # the modules only, no NDK needed
 #   cmake --build build --target ko-android14-6.1
+#   cmake --build build --target module     # the flashable zip (ko files + sync-tool + lkmloader)
 # Everything is written into build/ only: kmi/  ko/  dist/
+#
+# The zip additionally wants an Android NDK (sync-tool and lkmloader are cross
+# compiled with it): -DTOSYA_NDK=/path/to/ndk, or ANDROID_NDK_HOME in the
+# environment. Without one the ko targets still build and the package target
+# says so instead of failing.
 
 set(DDK_ROOT "/opt/ddk" CACHE PATH "DDK root (provides kdir/ and clang/)")
 option(TOSYA_USE_PREBUILT_KO "Package existing kernel modules from build/ko" OFF)
@@ -74,4 +80,165 @@ else()
   endforeach()
 endif()
 add_custom_target(ko DEPENDS ${_ko_outputs})
+
+# ---- the userspace half and the package --------------------------------------
+#
+# The module above is the kernel half. src/tools holds the userspace one --
+# sync-tool, which watches HMA's config, evaluates it and pushes the resulting
+# policy to the kernel over netlink -- and uidbench, the timing instrument.
+# Both are cross compiled with the Android NDK, which is the one thing in this
+# tree that needs one; the ko targets above do not.
+
+set(TOSYA_NDK "" CACHE PATH "Android NDK root (for sync-tool and lkmloader)")
+if(NOT TOSYA_NDK)
+  set(TOSYA_NDK "$ENV{ANDROID_NDK_HOME}")
+endif()
+
+# module id / version come from module/module.prop
+# The version git reports: <tag without its v> + the short hash, e.g. 0.6.0+a77bea6. module.prop
+# carries only the fallback, for a source tree without git (a release tarball).
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/module/module.prop" _prop)
+foreach(_l IN LISTS _prop)
+  if(_l MATCHES "^id=(.+)$")
+    set(TOSYA_ID "${CMAKE_MATCH_1}")
+  elseif(_l MATCHES "^version=(.+)$")
+    set(TOSYA_BASE "${CMAKE_MATCH_1}")
+  elseif(_l MATCHES "^versionCode=(.+)$")
+    set(TOSYA_BASE_CODE "${CMAKE_MATCH_1}")
+  endif()
+endforeach()
+
+function(tosya_git out)
+  execute_process(COMMAND git -C "${CMAKE_CURRENT_SOURCE_DIR}" ${ARGN}
+                  OUTPUT_VARIABLE _out OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET
+                  RESULT_VARIABLE _rc)
+  if(_rc EQUAL 0)
+    set(${out} "${_out}" PARENT_SCOPE)
+  endif()
+endfunction()
+
+tosya_git(_tag describe --tags --abbrev=0)
+tosya_git(_hash rev-parse --short HEAD)
+if(_tag)
+  string(REGEX REPLACE "^v" "" _tag "${_tag}")
+else()
+  set(_tag "${TOSYA_BASE}")
+endif()
+if(_hash)
+  tosya_git(_dirty status --porcelain)
+  if(_dirty)
+    set(_hash "${_hash}-dirty")
+  endif()
+  set(TOSYA_VER "${_tag}+${_hash}")
+else()
+  set(TOSYA_VER "${_tag}")
+endif()
+
+# versionCode has to be a number and has to grow: it is the tag as
+# major * 1000000 + minor * 1000 + patch, so 0.6.0 is 6000 and a new tag is the only thing that
+# raises it. A tag that is not x.y.z falls back to the value module.prop carries.
+if(_tag MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+  math(EXPR TOSYA_VERCODE "${CMAKE_MATCH_1} * 1000000 + ${CMAKE_MATCH_2} * 1000 + ${CMAKE_MATCH_3}")
+else()
+  set(TOSYA_VERCODE "${TOSYA_BASE_CODE}")
+endif()
+
+# A commit on the checked-out branch has to re-run this, or the version would be stale.
+foreach(_ref ".git/HEAD" ".git/packed-refs")
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_ref}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${_ref}")
+  endif()
+endforeach()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD")
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/.git/HEAD" _head)
+  if(_head MATCHES "^ref: (.+)$")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+                 "${CMAKE_CURRENT_SOURCE_DIR}/.git/${CMAKE_MATCH_1}")
+  endif()
+endif()
+
+# The module.prop that gets installed carries the version the module manager shows.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/module/module.prop" _prop_text)
+# By value, not by line anchor: file(READ) hands over the whole file and CMake's ^ matches only
+# the start of that string.
+string(REPLACE "version=${TOSYA_BASE}" "version=${TOSYA_VER}" _prop_text "${_prop_text}")
+string(REPLACE "versionCode=${TOSYA_BASE_CODE}" "versionCode=${TOSYA_VERCODE}" _prop_text "${_prop_text}")
+file(WRITE "${CMAKE_BINARY_DIR}/module.prop" "${_prop_text}")
+
+if(TOSYA_NDK)
+  # sync-tool: src/tools is a standalone CMake project, cross compiled with the NDK.
+  file(GLOB TOOL_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/tools/*")
+  set(TOSYA_TOOLS_BUILD "${CMAKE_BINARY_DIR}/tools-build")
+  set(TOSYA_SYNC "${TOSYA_TOOLS_BUILD}/sync-tool")
+  # The NDK toolchain restricts find_package to the sysroot by default; nlohmann_json
+  # comes from the host distro, so widen the package search scope.
+  add_custom_command(OUTPUT "${TOSYA_SYNC}"
+    COMMAND ${CMAKE_COMMAND} -S "${CMAKE_CURRENT_SOURCE_DIR}/src/tools" -B "${TOSYA_TOOLS_BUILD}"
+            -DCMAKE_TOOLCHAIN_FILE=${TOSYA_NDK}/build/cmake/android.toolchain.cmake
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=24 -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH
+    COMMAND ${CMAKE_COMMAND} --build "${TOSYA_TOOLS_BUILD}"
+    DEPENDS ${TOOL_SOURCES}
+    COMMENT "building sync-tool (CMake + NDK)"
+    VERBATIM)
+  add_custom_target(sync-tool DEPENDS "${TOSYA_SYNC}")
+
+  # lkmloader: external/lkmloader is a git submodule (see .gitmodules, and the gitlink this
+  # commit pins it to) and a standalone CMake project. It loads the ko by
+  # resolving undefined symbols from /proc/kallsyms and calling init_module, and rewrites the
+  # vermagic once when the kernel names the value it wants -- the same two things ksud insmod
+  # does, with no dependency on KernelSU being installed.
+  set(TOSYA_LKM_BUILD "${CMAKE_BINARY_DIR}/lkmloader-build")
+  set(TOSYA_LKM "${TOSYA_LKM_BUILD}/lkmloader")
+  file(GLOB LKM_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/external/lkmloader/*")
+
+  add_custom_command(OUTPUT "${TOSYA_LKM}"
+    COMMAND ${CMAKE_COMMAND} -S "${CMAKE_CURRENT_SOURCE_DIR}/external/lkmloader" -B "${TOSYA_LKM_BUILD}"
+            -DCMAKE_TOOLCHAIN_FILE=${TOSYA_NDK}/build/cmake/android.toolchain.cmake
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=24 -DCMAKE_BUILD_TYPE=Release
+    COMMAND ${CMAKE_COMMAND} --build "${TOSYA_LKM_BUILD}"
+    DEPENDS ${LKM_SOURCES}
+    COMMENT "building lkmloader (CMake + NDK)"
+    VERBATIM)
+  add_custom_target(lkmloader DEPENDS "${TOSYA_LKM}")
+
+  # Packaging: module/ template + ko + sync-tool + lkmloader into one zip (CMake's own tar).
+  set(TOSYA_STAGE "${CMAKE_BINARY_DIR}/stage")
+  file(GLOB TOSYA_MODULE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/module/*")
+  file(GLOB TOSYA_MODULE_ITEMS CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/module"
+       "${CMAKE_CURRENT_SOURCE_DIR}/module/*")
+  set(TOSYA_ZIP "${CMAKE_BINARY_DIR}/dist/${TOSYA_ID}-${TOSYA_VER}.zip")
+
+  add_custom_command(OUTPUT "${TOSYA_STAGE}/.stamp"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "${TOSYA_STAGE}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${TOSYA_STAGE}/ko"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/module" "${TOSYA_STAGE}"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_BINARY_DIR}/module.prop" "${TOSYA_STAGE}/module.prop"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${KO_DIR}" "${TOSYA_STAGE}/ko"
+    COMMAND ${CMAKE_COMMAND} -E copy "${TOSYA_SYNC}" "${TOSYA_STAGE}/sync-tool"
+    COMMAND ${CMAKE_COMMAND} -E copy "${TOSYA_LKM}" "${TOSYA_STAGE}/lkmloader"
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/external/lkmloader/LICENSE" "${TOSYA_STAGE}/lkmloader.LICENSE"
+    COMMAND ${CMAKE_COMMAND} -E touch "${TOSYA_STAGE}/.stamp"
+    DEPENDS ${_ko_outputs} sync-tool lkmloader ${TOSYA_MODULE_FILES}
+    COMMENT "staging module contents"
+    VERBATIM)
+
+  add_custom_command(OUTPUT "${TOSYA_ZIP}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
+    COMMAND ${CMAKE_COMMAND} -E rm -f "${TOSYA_ZIP}"
+    COMMAND ${CMAKE_COMMAND} -E tar cf "${TOSYA_ZIP}" --format=zip -- ${TOSYA_MODULE_ITEMS} sync-tool lkmloader lkmloader.LICENSE ko
+    WORKING_DIRECTORY "${TOSYA_STAGE}"
+    DEPENDS "${TOSYA_STAGE}/.stamp"
+    COMMENT "packing ${TOSYA_ZIP}"
+    VERBATIM)
+
+  add_custom_target(module ALL DEPENDS "${TOSYA_ZIP}")
+else()
+  # The ko targets above need no NDK; the package does. Say so instead of failing the
+  # default build on a machine that only builds modules.
+  add_custom_target(module ALL
+    COMMAND ${CMAKE_COMMAND} -E echo
+            "module: an Android NDK is required for sync-tool and lkmloader (-DTOSYA_NDK=/path/to/ndk or ANDROID_NDK_HOME); the ko targets above built without one"
+    VERBATIM)
+endif()
 
